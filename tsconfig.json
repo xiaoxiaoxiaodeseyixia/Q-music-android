@@ -1,21 +1,24 @@
 {
-  // https://github.com/tsconfig/bases#recommended-tsconfigjson
-  "extends": "@tsconfig/recommended/tsconfig.json",
+  "extends": "@react-native/typescript-config/tsconfig.json",     /* Recommended React Native TSConfig base */
   "compilerOptions": {
-    "target": "ESNext",
-    "allowJs": true,
+    /* Visit https://aka.ms/tsconfig.json to read more about this file */
+
     "module": "ESNext",
-    "moduleResolution": "bundler",
-    "resolveJsonModule": true,
+    "types": ["react-native", "node"],
+    /* Completeness */
+    "skipLibCheck": true,                                 /* Skip type checking all .d.ts files. */
+
     "rootDir": "./",
-    "outDir": "./dist",
-    // "paths": {                                           /* Specify a set of entries that re-map imports to additional lookup locations. */
-    //   "@common/*": ["common/*"],
-    //   "@renderer/*": ["renderer/*"],
-    //   "@main/*": ["main/*"],
-    //   // "@lyric/*": ["renderer-lyric/*"],
-    //   "@static/*": ["static/*"],
-    //   "@root/*": ["./*"],
-    // },
+    "paths": {
+      "@/*": ["./src/*"],
+      // "@config": ["src/config"],
+      // "@store": ["src/store"],
+      // "@components": ["src/components"],
+      // "@navigation": ["src/navigation"],
+      // "@screens": ["src/screens"],
+      // "@theme": ["src/theme"],
+      // "@utils": ["src/utils"],
+    }
   },
+  "exclude": ["node_modules", "build", "dist"]
 }

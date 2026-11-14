@@ -1,0 +1,197 @@
+import { BILIBILI_HEADERS, isBilibiliMediaUrl } from '@/utils/bilibili'
+import RNFS from 'react-native-fs'
+
+// 下载只解析在线地址，不能复用播放器的本地文件优先策略。
+import { getMusicPlayUrlInfo } from '@/core/music/online'
+import { requestStoragePermission } from '@/utils/tools'
+import { NativeModules } from 'react-native'
+import {
+  getDownloadTask,
+  removeDownloadTask,
+  upsertDownloadTask,
+} from './store'
+import type { DownloadStatus, DownloadTaskInfo } from './types'
+import { getDownloadDirectory } from './location'
+
+const { UtilsModule } = NativeModules
+
+const PROGRESS_THROTTLE = 300
+const MAX_CONCURRENT = 2
+
+const QUALITY_EXT: Record<LX.Quality, LX.Download.FileExt> = {
+  '128k': 'mp3',
+  '192k': 'mp3',
+  '320k': 'mp3',
+  flac: 'flac',
+  flac24bit: 'flac',
+  ape: 'ape',
+  wav: 'wav',
+}
+
+const runningTasks = new Set<string>()
+const deletingTasks = new Set<string>()
+const waitingQueue: string[] = []
+
+const formatSpeed = (bytesPerSecond: number) => {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '--'
+  const mb = bytesPerSecond / 1024 / 1024
+  return mb >= 1 ? `${mb.toFixed(1)}M/s` : `${Math.max(bytesPerSecond / 1024, 1).toFixed(0)}K/s`
+}
+
+const buildTask = (musicInfo: LX.Music.MusicInfoOnline, quality: LX.Quality): DownloadTaskInfo => {
+  const fileName = `${musicInfo.singer} - ${musicInfo.name}.${(musicInfo.source == 'bi' ? 'm4a' : QUALITY_EXT[quality])}`
+  return {
+    id: `${musicInfo.id}_${quality}`,
+    status: 'waiting',
+    statusText: '',
+    progress: 0,
+    downloaded: 0,
+    total: 0,
+    speed: '',
+    musicInfo,
+    quality,
+    fileName,
+    filePath: null,
+  }
+}
+
+const patchTask = (id: string, patch: Partial<DownloadTaskInfo>) => {
+  const task = getDownloadTask(id)
+  if (!task) return
+  upsertDownloadTask({ ...task, ...patch })
+}
+
+const scanMediaFile = async(filePath: string) => {
+  try {
+    await UtilsModule.scanMediaFile(filePath)
+  } catch (err) {
+    console.log('scan media file failed', err)
+  }
+}
+
+const runTask = async(taskId: string) => {
+  const task = getDownloadTask(taskId)
+  if (!task) return
+
+  patchTask(taskId, { status: 'run', statusText: '' })
+
+  try {
+    // 开始任务时固定目录，解析地址或下载期间修改设置不影响当前任务。
+    const directory = getDownloadDirectory()
+    const { url } = await getMusicPlayUrlInfo({
+      musicInfo: task.musicInfo,
+      quality: task.quality,
+      isRefresh: false,
+      allowToggleSource: false,
+    })
+
+    const dirExists = await RNFS.exists(directory)
+    if (!dirExists) await RNFS.mkdir(directory)
+
+    const filePath = `${directory}/${task.fileName.replace(/[\\/]/g, '_')}`
+    const toFile = `${RNFS.CachesDirectoryPath}/download_${taskId}.tmp`
+
+    let lastEmit = 0
+    let lastBytes = 0
+    let lastTime = 0
+    const downloadPromise = RNFS.downloadFile({
+      fromUrl: url,
+      headers: isBilibiliMediaUrl(url) ? BILIBILI_HEADERS : undefined,
+      toFile,
+      background: false,
+      progressInterval: PROGRESS_THROTTLE,
+      progress: (res) => {
+        const now = Date.now()
+        if (now - lastEmit < PROGRESS_THROTTLE) return
+        const elapsed = lastTime ? (now - lastTime) / 1000 : 0
+        const speed = elapsed > 0 ? formatSpeed((res.bytesWritten - lastBytes) / elapsed) : ''
+        lastEmit = now
+        lastBytes = res.bytesWritten
+        lastTime = now
+        patchTask(taskId, {
+          progress: Math.min(Math.round((res.bytesWritten / Math.max(res.contentLength, 1)) * 100), 100),
+          downloaded: res.bytesWritten,
+          total: res.contentLength,
+          speed,
+        })
+      },
+    })
+
+    const result = await downloadPromise.promise
+    if (result.statusCode && result.statusCode >= 400) throw new Error(`download failed: ${result.statusCode}`)
+
+    if (await RNFS.exists(filePath)) await RNFS.unlink(filePath)
+    await RNFS.moveFile(toFile, filePath)
+    await scanMediaFile(filePath)
+
+    patchTask(taskId, {
+      status: 'completed',
+      progress: 100,
+      statusText: '',
+      filePath,
+    })
+  } catch (err: any) {
+    patchTask(taskId, {
+      status: 'error',
+      statusText: err?.message ?? 'download failed',
+    })
+  }
+}
+
+const scheduleNext = () => {
+  while (runningTasks.size < MAX_CONCURRENT && waitingQueue.length) {
+    const taskId = waitingQueue.shift()!
+    if (runningTasks.has(taskId) || deletingTasks.has(taskId) || getDownloadTask(taskId)?.status != 'waiting') continue
+    runningTasks.add(taskId)
+    void runTask(taskId).finally(() => {
+      runningTasks.delete(taskId)
+      scheduleNext()
+    })
+  }
+}
+
+/**
+ * 添加下载任务：自动请求存储权限，去重后进入下载队列
+ */
+export const downloadMusics = async(musicInfos: LX.Music.MusicInfoOnline[], quality: LX.Quality) => {
+  const isGranted = await requestStoragePermission()
+  if (!isGranted) return false
+
+  for (const musicInfo of musicInfos) {
+    const task = buildTask(musicInfo, quality)
+    const existing = getDownloadTask(task.id)
+    if (deletingTasks.has(task.id) || runningTasks.has(task.id) || (existing && existing.status != 'error')) continue
+    upsertDownloadTask({ ...task, status: 'waiting' })
+    waitingQueue.push(task.id)
+  }
+  scheduleNext()
+  return true
+}
+
+export const retryDownload = (taskId: string) => {
+  const task = getDownloadTask(taskId)
+  if (!task || task.status != 'error' || runningTasks.has(taskId) || deletingTasks.has(taskId)) return
+  patchTask(taskId, { status: 'waiting', statusText: '', progress: 0 })
+  waitingQueue.push(taskId)
+  scheduleNext()
+}
+
+export const deleteDownloadTask = async(taskId: string, deleteFile = false) => {
+  const task = getDownloadTask(taskId)
+  if (!task || runningTasks.has(taskId) || deletingTasks.has(taskId)) return
+  deletingTasks.add(taskId)
+  try {
+    if (deleteFile && task.filePath) {
+      if (await RNFS.exists(task.filePath)) await RNFS.unlink(task.filePath)
+    }
+    // 成功后再移除记录；失败时保留任务，用户可以重试。
+    for (let index = waitingQueue.length - 1; index >= 0; index--) {
+      if (waitingQueue[index] == taskId) waitingQueue.splice(index, 1)
+    }
+    removeDownloadTask(taskId)
+  } finally {
+    deletingTasks.delete(taskId)
+  }
+}
+
+export type { DownloadStatus, DownloadTaskInfo }
